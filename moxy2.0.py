@@ -1,0 +1,347 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import matplotlib.dates as mdates
+from scipy.signal import find_peaks
+import os
+import glob
+
+class MoxyBFRWorkstation:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Moxy BFR 終極分析站 (修復參數調整時的縮放跳動)")
+        self.root.geometry("1450x900")
+        if 'clam' in ttk.Style().theme_names(): ttk.Style().theme_use('clam')
+
+        self.file_list, self.current_file_idx, self.df, self.filename_current = [], 0, None, ""
+        self.export_data = pd.DataFrame(columns=[
+            "檔案名稱", "工作流模式", "組別名稱", "起始時間", "結束時間", "起始值", "結束值", "斜率(Slope/s)", "曲面下面積(AUC)"
+        ])
+
+        # --- 互動變數 ---
+        self.start_index = tk.IntVar(value=0)           
+        self.analysis_mode = tk.StringVar(value="工作流1：運動期")
+        self.valley_prominence = tk.DoubleVar(value=5.0) 
+        self.valley_width = tk.IntVar(value=2)
+        self.min_dist = tk.IntVar(value=60)             
+
+        self.current_spans, self.selected_span_idx = [], -1   
+        self.adj_left, self.adj_right = tk.IntVar(), tk.IntVar()  
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.page_load = tk.Frame(self.notebook, padx=20, pady=20)
+        self.page_analysis = tk.Frame(self.notebook)
+        self.page_export = tk.Frame(self.notebook, padx=20, pady=20)
+
+        self.notebook.add(self.page_load, text="📁 1. 批次載入資料夾")
+        self.notebook.add(self.page_analysis, text="📈 2. 互動分析與微調 (含放大工具)")
+        self.notebook.add(self.page_export, text="📊 3. 資料管理與最終匯出")
+
+        self._build_load_page()
+        self._build_analysis_page()
+        self._build_export_page()
+
+    # ==================== 頁面 1 ====================
+    def _build_load_page(self):
+        tk.Label(self.page_load, text="Moxy 實驗數據批次管理", font=("Arial", 16, "bold")).pack(pady=10)
+        btn_frame = tk.Frame(self.page_load); btn_frame.pack(fill=tk.X)
+        tk.Button(btn_frame, text="📁 選擇 CSV 資料夾", command=self.load_folder, bg="#4CAF50", fg="white", font=("Arial", 12)).pack(side=tk.LEFT)
+        self.lbl_folder = tk.Label(self.page_load, text="尚未選取路徑...", fg="gray")
+        self.lbl_folder.pack(pady=10, anchor="w")
+        self.listbox_files = tk.Listbox(self.page_load, height=20, font=("Consolas", 11))
+        self.listbox_files.pack(fill=tk.BOTH, expand=True, pady=10)
+        tk.Button(self.page_load, text="🚀 開始分析", command=self.start_analysis, bg="#2196F3", fg="white", font=("Arial", 14, "bold"), pady=10).pack(fill=tk.X)
+
+    def load_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.lbl_folder.config(text=folder)
+            self.file_list = glob.glob(os.path.join(folder, "*.csv"))
+            self.listbox_files.delete(0, tk.END)
+            for f in self.file_list: self.listbox_files.insert(tk.END, os.path.basename(f))
+
+    def start_analysis(self):
+        if not self.file_list: return messagebox.showwarning("提示", "請先選擇資料夾！")
+        self.current_file_idx = 0
+        self.load_single_file()
+        self.notebook.select(self.page_analysis)
+
+    # ==================== 頁面 2: 分析與工具列 ====================
+    def _build_analysis_page(self):
+        top = tk.Frame(self.page_analysis, padx=10, pady=5)
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        info = tk.Frame(top)
+        info.pack(side=tk.TOP, fill=tk.X, pady=5)
+        self.lbl_file_status = tk.Label(info, text="目前檔案: 無", font=("Arial", 11, "bold"), fg="blue")
+        self.lbl_file_status.pack(side=tk.LEFT)
+        tk.Label(info, text=" | 模式: ").pack(side=tk.LEFT)
+        self.mode_cb = ttk.Combobox(info, textvariable=self.analysis_mode, state="readonly", width=20)
+        self.mode_cb['values'] = ("工作流1：運動期", "工作流2：組間休息", "工作流3：循環大休息")
+        self.mode_cb.pack(side=tk.LEFT)
+        
+        # ⚡ 換模式時：不保留縮放 (keep_zoom=False)
+        self.mode_cb.bind("<<ComboboxSelected>>", lambda e: self.run_auto_algorithm(keep_zoom=False))
+
+        ctrl = tk.Frame(top)
+        ctrl.pack(side=tk.TOP, fill=tk.X)
+
+        # --- 自動偵測區 ---
+        af = ttk.LabelFrame(ctrl, text="自動偵測參數設定")
+        af.pack(side=tk.LEFT, padx=5, fill=tk.Y)
+        
+        tk.Label(af, text="分析欄位:").grid(row=0, column=0, sticky="e")
+        self.column_combobox = ttk.Combobox(af, state="readonly", width=12)
+        self.column_combobox.grid(row=0, column=1)
+        # ⚡ 換欄位時：不保留縮放 (因為數值範圍 Y 軸會變)
+        self.column_combobox.bind("<<ComboboxSelected>>", lambda e: self.run_auto_algorithm(keep_zoom=False))
+        
+        # ⚡ 拉動參數拉桿時：全部保留縮放 (keep_zoom=True)！畫面不會再跳走
+        tk.Label(af, text="起始點(Bar):").grid(row=1, column=0, sticky="e")
+        self.start_slider = ttk.Scale(af, from_=0, to=100, variable=self.start_index, command=lambda e: self.run_auto_algorithm(keep_zoom=True))
+        self.start_slider.grid(row=1, column=1)
+
+        tk.Label(af, text="缺氧深度閾值:").grid(row=2, column=0, sticky="e")
+        ttk.Scale(af, from_=0.1, to=30.0, variable=self.valley_prominence, command=lambda e: self.run_auto_algorithm(keep_zoom=True)).grid(row=2, column=1)
+
+        tk.Label(af, text="最少運動波寬:").grid(row=3, column=0, sticky="e")
+        ttk.Scale(af, from_=1, to=50, variable=self.valley_width, command=lambda e: self.run_auto_algorithm(keep_zoom=True)).grid(row=3, column=1)
+
+        tk.Label(af, text="組間最小距離:").grid(row=4, column=0, sticky="e")
+        ttk.Scale(af, from_=10, to=200, variable=self.min_dist, command=lambda e: self.run_auto_algorithm(keep_zoom=True)).grid(row=4, column=1)
+
+        # --- 手動微調區 ---
+        adj_f = ttk.LabelFrame(ctrl, text="手動微調 (點擊圖中區塊)")
+        adj_f.pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        self.lbl_selected_set = tk.Label(adj_f, text="尚未選取區塊", fg="gray", font=("Arial", 10, "bold"))
+        self.lbl_selected_set.pack(pady=5)
+        f_l = tk.Frame(adj_f); f_l.pack()
+        tk.Label(f_l, text="左界:").pack(side=tk.LEFT)
+        self.slider_left = ttk.Scale(f_l, from_=0, to=100, variable=self.adj_left, length=150, command=self.apply_manual_tweak)
+        self.slider_left.pack(side=tk.LEFT)
+        f_r = tk.Frame(adj_f); f_r.pack()
+        tk.Label(f_r, text="右界:").pack(side=tk.LEFT)
+        self.slider_right = ttk.Scale(f_r, from_=0, to=100, variable=self.adj_right, length=150, command=self.apply_manual_tweak)
+        self.slider_right.pack(side=tk.LEFT)
+
+        # --- 操作按鈕區 ---
+        btn_f = tk.Frame(ctrl)
+        btn_f.pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Button(btn_f, text="✔️ 確定並存入暫存庫", command=self.save_current_analysis, bg="#FF9800", fg="white", font=("Arial", 10, "bold")).pack(fill=tk.X, pady=2)
+        tk.Button(btn_f, text="📸 匯出圖表 (PNG)", command=self.save_plot_image, bg="#009688", fg="white", font=("Arial", 10, "bold")).pack(fill=tk.X, pady=2)
+        tk.Button(btn_f, text="⏭️ 下一個檔案", command=self.next_file, bg="#9C27B0", fg="white", font=("Arial", 10, "bold")).pack(fill=tk.X, pady=2)
+
+        # --- 圖表與工具列區 ---
+        self.plot_frame = tk.Frame(self.page_analysis)
+        self.plot_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.figure, self.ax = plt.subplots(figsize=(12, 5))
+        self.figure.subplots_adjust(bottom=0.15) 
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
+        
+        self.toolbar_frame = tk.Frame(self.plot_frame)
+        self.toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
+        self.toolbar.update()
+        
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect('button_press_event', self.on_click_plot)
+
+    def load_single_file(self):
+        if self.current_file_idx >= len(self.file_list):
+            messagebox.showinfo("完成", "所有檔案已處理！請前往第三頁。")
+            self.notebook.select(self.page_export)
+            return
+        
+        file_path = self.file_list[self.current_file_idx]
+        self.filename_current = os.path.basename(file_path)
+        self.lbl_file_status.config(text=f"目前檔案: {self.filename_current} ({self.current_file_idx+1}/{len(self.file_list)})")
+
+        try:
+            try: self.df = pd.read_csv(file_path, skiprows=3, encoding='utf-8')
+            except: self.df = pd.read_csv(file_path, skiprows=3, encoding='big5')
+            
+            if 'hh:mm:ss' in self.df.columns:
+                self.df['Datetime'] = pd.to_datetime('2024-01-01 ' + self.df['hh:mm:ss'], errors='coerce')
+                self.df.set_index('Datetime', inplace=True)
+                self.df = self.df[~self.df.index.duplicated(keep='first')]
+                self.df = self.df.resample('1S').interpolate(method='linear')
+            else:
+                self.df.index = pd.date_range(start='2024-01-01 00:00:00', periods=len(self.df), freq='2S')
+                self.df = self.df.resample('1S').interpolate(method='linear')
+            
+            cols = self.df.select_dtypes(include=['number']).columns.tolist()
+            self.column_combobox['values'] = cols
+            if cols:
+                self.start_slider.config(to=len(self.df)-1)
+                self.column_combobox.set(next((c for c in cols if "SmO2" in c), cols[0]))
+                # 載入新檔案時：不保留縮放
+                self.run_auto_algorithm(keep_zoom=False)
+        except Exception as e:
+            messagebox.showerror("錯誤", f"無法分析：\n{e}")
+
+    # ⚡ 關鍵升級：加入了 keep_zoom 參數
+    def run_auto_algorithm(self, keep_zoom=False):
+        if self.df is None or not self.column_combobox.get(): return
+        mode = self.analysis_mode.get()
+        y = self.df[self.column_combobox.get()].values
+        start_pos = self.start_index.get()
+        
+        valleys, _ = find_peaks(-y, prominence=self.valley_prominence.get(), 
+                                width=self.valley_width.get(), 
+                                distance=self.min_dist.get())
+        valid_valleys = valleys[valleys >= start_pos]
+        
+        self.current_spans = []
+        if "運動期" in mode:
+            for i, v_idx in enumerate(valid_valleys[:15]):
+                search_start = max(start_pos, v_idx - 90) if i == 0 else max(valid_valleys[i-1], v_idx - 90)
+                p_idx = search_start + np.argmax(y[search_start:v_idx]) if search_start < v_idx else v_idx
+                self.current_spans.append({'label': f"C{i//3+1}-S{i%3+1}", 'left': p_idx, 'right': v_idx})
+                
+        elif "組間休息" in mode:
+            count = 0
+            for i, v_idx in enumerate(valid_valleys):
+                if (i % 3) == 2 or count >= 10: continue 
+                recovery_end = min(len(y)-1, v_idx + 60)
+                p_idx = v_idx + np.argmax(y[v_idx:recovery_end])
+                self.current_spans.append({'label': f"Rest-{count+1}", 'left': v_idx, 'right': p_idx})
+                count += 1
+                
+        elif "循環大休息" in mode:
+            for i, v_idx in enumerate(valid_valleys):
+                if (i % 3) == 2 and len(self.current_spans) < 5:
+                    rest_end = min(len(y)-1, v_idx + 180)
+                    self.current_spans.append({'label': f"CycleRest-{len(self.current_spans)+1}", 'left': v_idx, 'right': rest_end})
+
+        self.selected_span_idx = -1
+        self.lbl_selected_set.config(text="尚未選取區塊", fg="gray")
+        
+        # 將是否保留視角的指令傳遞給 render_plot
+        self.render_plot(keep_zoom=keep_zoom)
+
+    def on_click_plot(self, event):
+        # ⚡ 防呆：如果在用放大鏡或平移，就不觸發點選
+        if hasattr(self, 'toolbar') and self.toolbar.mode != '': return 
+        
+        if event.inaxes != self.ax or event.xdata is None: return
+        click_t = pd.Timestamp(mdates.num2date(event.xdata).replace(tzinfo=None))
+        x = self.df.index
+        for i, span in enumerate(self.current_spans):
+            if x[span['left']] <= click_t <= x[span['right']]:
+                self.selected_span_idx = i
+                self.lbl_selected_set.config(text=f"調整中: {span['label']}", fg="orange")
+                self.slider_left.config(from_=max(0, span['left']-120), to=span['right']-1)
+                self.slider_right.config(from_=span['left']+1, to=min(len(self.df)-1, span['right']+120))
+                self.adj_left.set(span['left']); self.adj_right.set(span['right'])
+                self.render_plot(keep_zoom=True); break
+
+    def apply_manual_tweak(self, e=None):
+        if self.selected_span_idx >= 0:
+            self.current_spans[self.selected_span_idx]['left'] = self.adj_left.get()
+            self.current_spans[self.selected_span_idx]['right'] = self.adj_right.get()
+            self.render_plot(keep_zoom=True)
+
+    def render_plot(self, keep_zoom=False):
+        if self.df is None: return
+        
+        # 記憶視角
+        xlim = self.ax.get_xlim() if keep_zoom and self.ax.has_data() else None
+        ylim = self.ax.get_ylim() if keep_zoom and self.ax.has_data() else None
+        
+        col = self.column_combobox.get()
+        y, x = self.df[col].values, self.df.index
+        self.ax.clear()
+        self.ax.plot(x, y, color='#D62728', alpha=0.8, label=col)
+        self.ax.axvline(x=x[self.start_index.get()], color='black', ls='--')
+        
+        for i, span in enumerate(self.current_spans):
+            l_idx, r_idx = span['left'], span['right']
+            color = '#FFC107' if i == self.selected_span_idx else 'gray'
+            self.ax.axvspan(x[l_idx], x[r_idx], color=color, alpha=0.4)
+            self.ax.text(x[l_idx], np.max(y), span['label'], fontsize=8, color='blue', rotation=45)
+            
+        self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        self.ax.set_title(f"模式: {self.analysis_mode.get()} | 檔案: {self.filename_current}")
+        
+        # 恢復視角
+        if keep_zoom and xlim and ylim and xlim != (0.0, 1.0):
+            self.ax.set_xlim(xlim); self.ax.set_ylim(ylim)
+            
+        self.figure.autofmt_xdate(); self.canvas.draw()
+
+    def save_plot_image(self):
+        if self.df is None: return
+        default_name = f"{self.filename_current.replace('.csv', '')}_{self.analysis_mode.get()}.png"
+        path = filedialog.asksaveasfilename(defaultextension=".png", initialfile=default_name, filetypes=[("PNG", "*.png")])
+        if path: self.figure.savefig(path, dpi=300, bbox_inches='tight')
+
+    def save_current_analysis(self):
+        if not self.current_spans: return
+        y, x = self.df[self.column_combobox.get()].values, self.df.index
+        
+        new_rows = []
+        for span in self.current_spans:
+            l, r = span['left'], span['right']
+            s_val, e_val = y[l], y[r]
+            dur = max(1, r - l)
+            new_rows.append({
+                "檔案名稱": self.filename_current,
+                "工作流模式": self.analysis_mode.get(),
+                "組別名稱": span['label'],
+                "起始時間": x[l].strftime('%H:%M:%S'),
+                "結束時間": x[r].strftime('%H:%M:%S'),
+                "起始值": round(s_val, 2), "結束值": round(e_val, 2),
+                "斜率(Slope/s)": round((e_val - s_val) / dur, 4),
+                "曲面下面積(AUC)": round(np.trapz(y[l:r+1]), 2)
+            })
+        self.export_data = pd.concat([self.export_data, pd.DataFrame(new_rows)], ignore_index=True)
+        self.update_treeview()
+        messagebox.showinfo("成功", f"暫存 {len(new_rows)} 筆。")
+
+    def next_file(self):
+        self.current_file_idx += 1
+        self.load_single_file()
+
+    # ==================== 頁面 3 ====================
+    def _build_export_page(self):
+        tk.Label(self.page_export, text="資料管理與最終報告匯出", font=("Arial", 16, "bold")).pack(pady=10)
+        cols = list(self.export_data.columns)
+        self.tree = ttk.Treeview(self.page_export, columns=cols, show="headings")
+        for c in cols: self.tree.heading(c, text=c); self.tree.column(c, width=110, anchor="center")
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        
+        bar = tk.Frame(self.page_export, pady=10); bar.pack(fill=tk.X)
+        tk.Button(bar, text="🗑️ 刪除選取", command=self.delete_row, bg="#F44336", fg="white").pack(side=tk.LEFT, padx=5)
+        tk.Button(bar, text="💾 匯出總表 (CSV)", command=self.export_all, bg="#4CAF50", fg="white", font=("Arial", 12, "bold")).pack(side=tk.RIGHT)
+
+    def update_treeview(self):
+        for i in self.tree.get_children(): self.tree.delete(i)
+        for _, r in self.export_data.iterrows(): self.tree.insert("", "end", values=list(r))
+
+    def delete_row(self):
+        for s in self.tree.selection():
+            v = self.tree.item(s, "values")
+            m = (self.export_data["檔案名稱"] == v[0]) & (self.export_data["組別名稱"] == v[2]) & (self.export_data["起始時間"] == v[3])
+            self.export_data = self.export_data[~m]
+        self.update_treeview()
+
+    def export_all(self):
+        if self.export_data.empty: return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
+        if path:
+            self.export_data.to_csv(path, index=False, encoding='utf-8-sig')
+            messagebox.showinfo("成功", "匯出完畢！")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MoxyBFRWorkstation(root)
+    root.mainloop()
